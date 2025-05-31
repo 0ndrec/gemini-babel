@@ -75,7 +75,6 @@ const App: React.FC = () => {
       </main>
       <footer className="w-full max-w-4xl mx-auto text-center py-8 text-sm text-gray-500">
         <p>Powered by Google Gemini. For Flask/Babel .po file generation.</p>
-        <p>Ensure your <code className="bg-gray-700 px-1 rounded">process.env.API_KEY</code> is configured.</p>
       </footer>
     </div>
   );

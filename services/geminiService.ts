@@ -1,18 +1,25 @@
-
 import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
 import { Language } from '../constants';
-import { ProgressData } from "../components/ProgressTracker"; // Assuming ProgressData is exported from ProgressTracker or a types file
+import { ProgressData } from "../components/ProgressTracker";
 
 const API_KEY = process.env.API_KEY;
 
 if (!API_KEY) {
   console.error("API_KEY environment variable is not set. Gemini API calls will fail.");
 }
-// Initialize GoogleGenAI with the API key from environment variables
-// Ensure this is only initialized once
-const ai = API_KEY ? new GoogleGenAI({ apiKey: API_KEY }) : null;
 
+const ai = API_KEY ? new GoogleGenAI({ apiKey: API_KEY }) : null;
 const GEMINI_MODEL = "gemini-2.5-flash-preview-04-17";
+
+interface GeminiTranslationRequestItem {
+  id: number;
+  text: string;
+}
+
+interface GeminiTranslationResponseItem {
+  id: number;
+  translation: string;
+}
 
 const generatePoHeader = (targetLanguage: Language): string => {
   const now = new Date();
@@ -36,83 +43,120 @@ msgstr ""
 `;
 };
 
-
-const translateSingleText = async (
-  text: string,
-  sourceLanguage: Language,
-  targetLanguage: Language
-): Promise<string> => {
-  if (!ai) {
-    throw new Error("Gemini AI SDK not initialized. API_KEY might be missing.");
-  }
-
-  const prompt = `
-You are an expert multilingual translator specializing in software internationalization for Python Flask applications using Babel.
-Your task is to translate the given text string accurately from ${sourceLanguage.name} to ${targetLanguage.name}.
-
-Crucial Instructions:
-1.  **Preserve Placeholders**: Retain all Python-style formatting placeholders (e.g., \`%(name)s\`, \`%s\`, \`%d\`, \`{variable}\`) and HTML tags (e.g. \`<b>\`, \`<a>\`) exactly as they appear in the original string. Do not translate the content of these placeholders.
-2.  **Exact Output**: Provide *only* the translated string as your response. Do not include any explanations, apologies, conversational filler, or markdown formatting like backticks around the translated string.
-3.  **Context**: The string is part of a software application and will be used with gettext.
-4.  **Special Characters**: Ensure all special characters (like newlines \`\\n\`, tabs \`\\t\`) are preserved or correctly represented in the translation if they are part of the original string's meaning.
-
-Original Text (${sourceLanguage.name}):
-"${text.replace(/"/g, '\\"')}"
-
-Translated Text (${targetLanguage.name}):
-`;
-
-  try {
-    const response: GenerateContentResponse = await ai.models.generateContent({
-        model: GEMINI_MODEL,
-        contents: [{ role: "user", parts: [{text: prompt}] }],
-        config: {
-            // For translation, higher quality is preferred. Default thinking behavior.
-            // temperature: 0.3, // Lower temperature for more deterministic translations
-        }
-    });
-    const translation = response.text?.trim() || "";
-    if (translation.startsWith('"') && translation.endsWith('"')) {
-        return translation.substring(1, translation.length - 1).replace(/\\"/g, '"');
-    }
-    return translation.replace(/\\"/g, '"');
-
-  } catch (error) {
-    console.error(`Error translating text "${text}":`, error);
-    return `TRANSLATION_ERROR: ${text}`; 
-  }
-};
-
 export const translateTextsToPo = async (
   inputText: string,
   sourceLanguage: Language,
   targetLanguage: Language,
   onProgress: (data: Partial<ProgressData>) => void
 ): Promise<string> => {
+  if (!ai) {
+    throw new Error("Gemini AI SDK not initialized. API_KEY might be missing.");
+  }
+
   const msgids = inputText.split('\n').map(line => line.trim()).filter(line => line.length > 0);
   
-  onProgress({ totalStrings: msgids.length, currentIndex: 0, currentText: '' });
-
-  if (msgids.length === 0) {
+  const totalStrings = msgids.length;
+  if (totalStrings === 0) {
     return generatePoHeader(targetLanguage);
   }
 
-  let poFileContent = generatePoHeader(targetLanguage);
-  let currentIndex = 0;
+  onProgress({ totalStrings, currentIndex: 0, currentText: `Preparing to translate ${totalStrings} strings...` });
 
-  for (const msgid of msgids) {
-    currentIndex++;
-    onProgress({ currentIndex, currentText: msgid });
+  const textsToTranslate: GeminiTranslationRequestItem[] = msgids.map((text, index) => ({ id: index, text: text }));
 
-    const escapedMsgid = msgid.replace(/"/g, '\\"').replace(/\n/g, '\\n');
-    const translatedText = await translateSingleText(msgid, sourceLanguage, targetLanguage);
-    const escapedTranslatedText = translatedText.replace(/"/g, '\\"').replace(/\n/g, '\\n');
+  const prompt = `
+Translate each text string in the provided JSON array from ${sourceLanguage.name} to ${targetLanguage.name}.
+Return a JSON array of objects. Each object in the output array must have:
+1. An "id" field, exactly matching the "id" from the input object.
+2. A "translation" field, containing only the translated string.
 
-    poFileContent += `\n`;
-    poFileContent += `#. Automatically-generated entry by Gemini BabelGen\n`;
-    poFileContent += `msgid "${escapedMsgid}"\n`;
-    poFileContent += `msgstr "${escapedTranslatedText}"\n`;
+Strict rules for EACH translation:
+- Preserve placeholders (e.g., %(name)s, %s, {variable_name}, {{placeholder}}).
+- Preserve HTML tags (e.g., <b>, <i>, <a href="...">).
+- Correctly handle special characters like newlines (\\n), tabs (\\t). The output translation string itself should not be JSON escaped unless the special characters are part of the actual translation (e.g. a translated string literally containing '\\n').
+- The "translation" field must contain ONLY the translated text, no extra explanations or markdown.
+
+Input array of texts to translate:
+${JSON.stringify(textsToTranslate)}
+
+Respond ONLY with the JSON array of translation results. Ensure the output is a valid JSON array.
+Example of a single item in the output array: {"id": 0, "translation": "Translated text here"}
+`;
+
+  try {
+    onProgress({ currentText: `Translating ${totalStrings} strings in a batch...` });
+    const response: GenerateContentResponse = await ai.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        // Omitting thinkingConfig to use default (enabled thinking for higher quality)
+      }
+    });
+
+    let jsonStr = response.text?.trim() || "";
+    const fenceRegex = /^```(?:json)?\s*\n?(.*?)\n?\s*```$/si;
+    const match = jsonStr.match(fenceRegex);
+    if (match && match[1]) {
+      jsonStr = match[1].trim();
+    }
+
+    let translatedItems: GeminiTranslationResponseItem[] = [];
+    try {
+      translatedItems = JSON.parse(jsonStr);
+      if (!Array.isArray(translatedItems) || !translatedItems.every(item => typeof item.id === 'number' && typeof item.translation === 'string')) {
+        console.error("Parsed JSON is not an array of {id: number, translation: string}:", translatedItems);
+        throw new Error("Translation service returned an unexpected data structure. Ensure the model provides a valid JSON array of {id, translation} objects.");
+      }
+    } catch (e) {
+      console.error("Failed to parse JSON response from Gemini:", e);
+      console.error("Raw response text (check for malformed JSON or non-JSON error message):", response.text);
+      throw new Error(`Failed to parse translations from AI. The AI response was not valid JSON or did not match the expected format. Raw response: "${response.text.substring(0, 500)}${response.text.length > 500 ? '...' : ''}"`);
+    }
+    
+    onProgress({ currentText: `Received ${translatedItems.length} translations, formatting .po file...` });
+
+    const translationsMap = new Map<number, string>();
+    translatedItems.forEach(item => {
+      translationsMap.set(item.id, item.translation);
+    });
+
+    let poFileContent = generatePoHeader(targetLanguage);
+    let processedCount = 0;
+
+    for (let i = 0; i < totalStrings; i++) {
+      const msgid = msgids[i];
+      const translatedText = translationsMap.get(i);
+
+      const escapedMsgid = msgid.replace(/"/g, '\\"').replace(/\n/g, '\\n');
+      let escapedTranslatedText: string;
+
+      if (translatedText !== undefined) {
+        // The translation from Gemini should be the direct string.
+        // Escape it for .po format here.
+        escapedTranslatedText = translatedText.replace(/"/g, '\\"').replace(/\n/g, '\\n');
+      } else {
+        console.warn(`No translation found for msgid (id: ${i}): "${msgid}". Using original with error marker.`);
+        // Escape the original msgid to ensure valid PO format for the error message
+        escapedTranslatedText = `TRANSLATION_ERROR_MISSING: ${escapedMsgid}`;
+      }
+
+      poFileContent += `\n`;
+      poFileContent += `#. Automatically-generated entry by Gemini BabelGen\n`;
+      poFileContent += `msgid "${escapedMsgid}"\n`;
+      poFileContent += `msgstr "${escapedTranslatedText}"\n`;
+      processedCount++;
+    }
+    
+    onProgress({ currentIndex: processedCount, currentText: `All ${processedCount} strings processed.` });
+    return poFileContent;
+
+  } catch (error) {
+    console.error(`Error in batch translation:`, error);
+    // Add more context to the error if it's a known type from the SDK
+    if (error && typeof error === 'object' && 'message' in error) {
+        throw new Error(`Batch translation failed: ${error.message}`);
+    }
+    throw new Error(`An unknown error occurred during batch translation.`);
   }
-
-  return poFileContent;
 };
