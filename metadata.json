@@ -1,0 +1,6 @@
+{
+  "name": "Gemini Flask BabelGen",
+  "description": "A web tool to generate .po translation files for Flask applications using Google Gemini. Paste your strings, choose languages, and get your .po content formatted for Babel.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}
